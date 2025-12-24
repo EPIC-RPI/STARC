@@ -1,0 +1,466 @@
+from typing import Optional, Tuple
+
+import torch
+import torch.functional as F
+
+import transformers.models
+from transformers.models.llama.modeling_llama import (
+    LlamaForCausalLM,
+    CausalLMOutputWithPast,
+    List,
+    Union,
+    CrossEntropyLoss,
+    BaseModelOutputWithPast,
+    apply_rotary_pos_emb,
+)
+import types
+
+from flash_attn import flash_attn_func, flash_attn_varlen_func
+from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
+
+import transformers
+
+
+# Utilities for FlashAttention unpadding/padding with left-padded sequences.
+def _get_unpad_data(padding_mask):
+    seqlens_in_batch = padding_mask.sum(dim=-1, dtype=torch.int32)
+    indices = torch.nonzero(padding_mask.flatten(), as_tuple=False).flatten()
+    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    cu_seqlens = F.pad(
+        torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0)
+    )
+    return (
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+    )
+
+
+# FlashAttention2-style forward compatible with tuple-style KV cache.
+def old_flash_attention_2_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    padding_mask: Optional[torch.LongTensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    output_attentions = False
+
+    bsz, q_len, _ = hidden_states.size()
+
+    query_states = self.q_proj(hidden_states)
+    key_states = self.k_proj(hidden_states)
+    value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(
+        bsz, q_len, self.num_heads, self.head_dim
+    ).transpose(1, 2)
+    key_states = key_states.view(
+        bsz, q_len, self.num_key_value_heads, self.head_dim
+    ).transpose(1, 2)
+    value_states = value_states.view(
+        bsz, q_len, self.num_key_value_heads, self.head_dim
+    ).transpose(1, 2)
+
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value[0].shape[-2]
+
+    cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_value is not None:
+        key_states = torch.cat([past_key_value[0], key_states], dim=2)
+        value_states = torch.cat([past_key_value[1], value_states], dim=2)
+
+    past_key_value = (key_states, value_states) if use_cache else None
+
+    query_states = query_states.transpose(1, 2)
+    key_states = key_states.transpose(1, 2)
+    value_states = value_states.transpose(1, 2)
+
+    dropout_rate = 0.0
+
+    input_dtype = query_states.dtype
+    if input_dtype == torch.float32:
+        query_states = query_states.to(torch.float16)
+        key_states = key_states.to(torch.float16)
+        value_states = value_states.to(torch.float16)
+
+    attn_output = self._flash_attention_forward(
+        query_states,
+        key_states,
+        value_states,
+        padding_mask,
+        q_len,
+        dropout=dropout_rate,
+    )
+
+    attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
+    attn_output = self.o_proj(attn_output)
+
+    if not output_attentions:
+        attn_weights = None
+
+    return attn_output, attn_weights, past_key_value
+
+
+# FlashAttention kernel dispatch: varlen path for padded inputs, dense path otherwise.
+def _flash_attention_forward(
+    self,
+    query_states,
+    key_states,
+    value_states,
+    padding_mask,
+    query_length,
+    dropout=0.0,
+    softmax_scale=None,
+):
+    if padding_mask is not None:
+        batch_size = query_states.shape[0]
+        (
+            query_states,
+            key_states,
+            value_states,
+            indices_q,
+            cu_seq_lens,
+            max_seq_lens,
+        ) = self._upad_input(
+            query_states, key_states, value_states, padding_mask, query_length
+        )
+
+        cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+        max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
+
+        attn_output_unpad = flash_attn_varlen_func(
+            query_states,
+            key_states,
+            value_states,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_in_batch_q,
+            max_seqlen_k=max_seqlen_in_batch_k,
+            dropout_p=dropout,
+            softmax_scale=softmax_scale,
+            causal=True,
+        )
+
+        attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
+    else:
+        attn_output = flash_attn_func(
+            query_states,
+            key_states,
+            value_states,
+            dropout,
+            softmax_scale=softmax_scale,
+            causal=True,
+        )
+
+    return attn_output
+
+
+# Helper to unpad Q/K/V for FlashAttention varlen kernels (assumes left padding).
+def _upad_input(self, query_layer, key_layer, value_layer, padding_mask, query_length):
+    indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(padding_mask)
+    batch_size, kv_seq_len, num_key_value_heads, head_dim = key_layer.shape
+
+    key_layer = index_first_axis(
+        key_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
+        indices_k,
+    )
+    value_layer = index_first_axis(
+        value_layer.reshape(batch_size * kv_seq_len, num_key_value_heads, head_dim),
+        indices_k,
+    )
+    if query_length == kv_seq_len:
+        query_layer = index_first_axis(
+            query_layer.reshape(batch_size * kv_seq_len, self.num_heads, head_dim),
+            indices_k,
+        )
+        cu_seqlens_q = cu_seqlens_k
+        max_seqlen_in_batch_q = max_seqlen_in_batch_k
+        indices_q = indices_k
+    elif query_length == 1:
+        max_seqlen_in_batch_q = 1
+        cu_seqlens_q = torch.arange(
+            batch_size + 1, dtype=torch.int32, device=query_layer.device
+        )
+        indices_q = cu_seqlens_q[:-1]
+        query_layer = query_layer.squeeze(1)
+    else:
+        padding_mask = padding_mask[:, -query_length:]
+        query_layer, indices_q, cu_seqlens_q, max_seqlen_in_batch_q = unpad_input(
+            query_layer, padding_mask
+        )
+
+    return (
+        query_layer,
+        key_layer,
+        value_layer,
+        indices_q,
+        (cu_seqlens_q, cu_seqlens_k),
+        (max_seqlen_in_batch_q, max_seqlen_in_batch_k),
+    )
+
+
+# Tuple-style KV cache forward for LlamaForCausalLM (mirrors HF Transformers v4.34.0 behavior).
+def old_llama_for_causal_lm_forward(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[List[torch.FloatTensor]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    labels: Optional[torch.LongTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+) -> Union[Tuple, CausalLMOutputWithPast]:
+    output_attentions = (
+        output_attentions
+        if output_attentions is not None
+        else self.config.output_attentions
+    )
+    output_hidden_states = (
+        output_hidden_states
+        if output_hidden_states is not None
+        else self.config.output_hidden_states
+    )
+    return_dict = (
+        return_dict if return_dict is not None else self.config.use_return_dict
+    )
+
+    outputs = self.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=inputs_embeds,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+        output_hidden_states=output_hidden_states,
+        return_dict=return_dict,
+    )
+
+    hidden_states = outputs[0]
+
+    if self.training:
+        logits = self.lm_head(hidden_states)
+    else:
+        logits = self.lm_head(hidden_states[:, -1:, :])
+
+    logits = logits.float()
+
+    loss = None
+    if labels is not None:
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss_fct = CrossEntropyLoss()
+        shift_logits = shift_logits.view(-1, self.config.vocab_size)
+        shift_labels = shift_labels.view(-1)
+        shift_labels = shift_labels.to(shift_logits.device)
+        loss = loss_fct(shift_logits, shift_labels)
+
+    if not return_dict:
+        output = (logits,) + outputs[1:]
+        return (loss,) + output if loss is not None else output
+
+    return CausalLMOutputWithPast(
+        loss=loss,
+        logits=logits,
+        past_key_values=outputs.past_key_values,
+        hidden_states=outputs.hidden_states,
+        attentions=outputs.attentions,
+    )
+
+
+# Tuple-style KV cache forward for LlamaModel (mirrors HF Transformers v4.34.0 behavior).
+def old_llama_model_forward(
+    self,
+    input_ids: torch.LongTensor = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_values: Optional[List[torch.FloatTensor]] = None,
+    inputs_embeds: Optional[torch.FloatTensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+) -> Union[Tuple, BaseModelOutputWithPast]:
+    output_attentions = (
+        output_attentions
+        if output_attentions is not None
+        else self.config.output_attentions
+    )
+    output_hidden_states = (
+        output_hidden_states
+        if output_hidden_states is not None
+        else self.config.output_hidden_states
+    )
+    use_cache = use_cache if use_cache is not None else self.config.use_cache
+
+    return_dict = (
+        return_dict if return_dict is not None
+        else self.config.use_return_dict
+    )
+
+    if input_ids is not None and inputs_embeds is not None:
+        raise ValueError(
+            "You cannot specify both input_ids and inputs_embeds at the same time"
+        )
+    elif input_ids is not None:
+        batch_size, seq_length = input_ids.shape
+    elif inputs_embeds is not None:
+        batch_size, seq_length, _ = inputs_embeds.shape
+    else:
+        raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+    seq_length_with_past = seq_length
+    past_key_values_length = 0
+
+    if past_key_values is not None:
+        past_key_values_length = past_key_values[0][0].shape[2]
+        seq_length_with_past = seq_length_with_past + past_key_values_length
+
+    if position_ids is None:
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+        position_ids = torch.arange(
+            past_key_values_length,
+            seq_length + past_key_values_length,
+            dtype=torch.long,
+            device=device,
+        )
+        position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
+    else:
+        position_ids = position_ids.view(-1, seq_length).long()
+
+    if inputs_embeds is None:
+        inputs_embeds = self.embed_tokens(input_ids)
+
+    if attention_mask is None:
+        attention_mask = torch.ones(
+            (batch_size, seq_length_with_past),
+            dtype=torch.bool,
+            device=inputs_embeds.device,
+        )
+        padding_mask = None
+    else:
+        if 0 in attention_mask:
+            padding_mask = attention_mask
+        else:
+            padding_mask = None
+
+    attention_mask = self._prepare_decoder_attention_mask(
+        attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
+    )
+
+    hidden_states = inputs_embeds
+
+    all_hidden_states = () if output_hidden_states else None
+    all_self_attns = () if output_attentions else None
+    next_decoder_cache = () if use_cache else None
+
+    for idx, decoder_layer in enumerate(self.layers):
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        past_key_value = past_key_values[idx] if past_key_values is not None else None
+
+        layer_outputs = decoder_layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+            padding_mask=padding_mask,
+        )
+
+        hidden_states = layer_outputs[0]
+
+        if use_cache:
+            next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+
+        if output_attentions:
+            all_self_attns += (layer_outputs[1],)
+
+    hidden_states = self.norm(hidden_states)
+
+    if output_hidden_states:
+        all_hidden_states += (hidden_states,)
+
+    next_cache = next_decoder_cache if use_cache else None
+    if not return_dict:
+        return tuple(
+            v
+            for v in [hidden_states, next_cache, all_hidden_states, all_self_attns]
+            if v is not None
+        )
+    return BaseModelOutputWithPast(
+        last_hidden_state=hidden_states,
+        past_key_values=next_cache,
+        hidden_states=all_hidden_states,
+        attentions=all_self_attns,
+    )
+
+
+# Tuple-style KV cache forward for LlamaDecoderLayer (mirrors HF Transformers v4.34.0 behavior).
+def old_llama_decoder_layer_forward(
+    self,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.LongTensor] = None,
+    past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    output_attentions: Optional[bool] = False,
+    use_cache: Optional[bool] = False,
+    padding_mask: Optional[torch.LongTensor] = None,
+) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+    residual = hidden_states
+
+    hidden_states = self.input_layernorm(hidden_states)
+
+    hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states=hidden_states,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+        output_attentions=output_attentions,
+        use_cache=use_cache,
+        padding_mask=padding_mask,
+    )
+    hidden_states = residual + hidden_states
+
+    residual = hidden_states
+    hidden_states = self.post_attention_layernorm(hidden_states)
+    hidden_states = self.mlp(hidden_states)
+    hidden_states = residual + hidden_states
+
+    outputs = (hidden_states,)
+
+    if output_attentions:
+        outputs += (self_attn_weights,)
+
+    if use_cache:
+        outputs += (present_key_value,)
+
+    return outputs
+
+
+# Monkey-patch Transformers Llama modules to use tuple-style KV cache and FlashAttention forwards.
+def enable_tuple_kv_cache_for_llama():
+    print("Enabling tuple KV cache for Llama")
+    transformers.models.llama.modeling_llama.LlamaModel._prepare_decoder_attention_mask = (
+        lambda *args, **kwargs: None
+    )
+    transformers.models.llama.modeling_llama.LlamaModel.forward = old_llama_model_forward
+    transformers.models.llama.modeling_llama.LlamaDecoderLayer.forward = old_llama_decoder_layer_forward
+    transformers.models.llama.modeling_llama.LlamaAttention.forward = old_flash_attention_2_forward
+    transformers.models.llama.modeling_llama.LlamaSdpaAttention.forward = old_flash_attention_2_forward
+    transformers.models.llama.modeling_llama.LlamaFlashAttention2.forward = old_flash_attention_2_forward
+    transformers.models.llama.modeling_llama.LlamaAttention._upad_input = _upad_input
+    transformers.models.llama.modeling_llama.LlamaAttention._flash_attention_forward = _flash_attention_forward
+    transformers.models.llama.modeling_llama.LlamaForCausalLM.forward = old_llama_for_causal_lm_forward
