@@ -28,8 +28,6 @@ This repository provides a complete workflow to reproduce the key results of **S
   - [E3: RULER (32K context)](#e3-ruler-32k-context)
   - [E4: GPU–PIM system simulation](#e4-gpupim-system-simulation)
 - [Outputs](#outputs)
-- [Methodology](#methodology)
-- [License](#license)
 
 ---
 
