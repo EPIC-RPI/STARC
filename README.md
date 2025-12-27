@@ -112,7 +112,7 @@ bash set_pim_ramulator.sh
 cd ramulator2
 mkdir build
 cd build
-cmake ..
+cmake .. -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 make -j
 cp ramulator2 ../ramulator2
 cd ../../
@@ -184,7 +184,7 @@ To reproduce the results for configurations with sparse attention methods:
 python main.py --system dgx-attacc --gpu H100 --ngpu 8 --model Mistral-7B \
   --lin 2048 --lout 24000 --batch 16 --pim bank \
   --powerlimit --ffopt --pipeopt \
-  --sparsity --kv_budget_table kv_budget_Mistral.txt
+  --sparsity --kv_budget_table kv_budget_Mistral_STARC.txt
 ```
 
 Different sparse attention methods and models use different `.txt` files specified by the `--kv_budget_table` option. These files are derived from the attention masks produced by each method at each decoding step in real inference tasks (e.g., LongBench), and map them to the row-level granularity of the PIM architecture, where each DRAM row activation fetches 16 key/value vectors in parallel. They define how many memory rows are activated at each decoding step and are used to guide the simulator accordingly.
