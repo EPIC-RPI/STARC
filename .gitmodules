@@ -1,3 +1,6 @@
 [submodule "scripts/flash-attention"]
 	path = scripts/flash-attention
 	url = https://github.com/Dao-AILab/flash-attention.git
+[submodule "simulator_starc/ramulator2"]
+	path = simulator_starc/ramulator2
+	url = https://github.com/CMU-SAFARI/ramulator2.git
