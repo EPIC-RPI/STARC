@@ -1,4 +1,4 @@
-cd /home/fanz2/STARC/evaluation/LongBench/
+cd /home/fanz2/STARC/evaluation/LongBench/  # Change it to your path.
 
 model="Mistral-7B-Instruct-v0.3"
 for task in "2wikimqa" "multifieldqa_en" "hotpotqa" "lcc" "musique" "narrativeqa" "passage_retrieval_en" "qasper" "samsum" "triviaqa" "repobench-p" "gov_report" "trec" "multi_news" "passage_count" "qmsum"

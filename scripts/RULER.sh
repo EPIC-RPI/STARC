@@ -1,4 +1,4 @@
-cd /home/fanz2/STARC/evaluation/LongBench/
+cd /home/fanz2/STARC/evaluation/LongBench/  # Change it to your path.
 
 CUDA_VISIBLE_DEVICES=0,1 python ruler_eval.py \
   --model Meta-Llama-3.1-8B-Instruct \

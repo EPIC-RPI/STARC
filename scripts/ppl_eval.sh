@@ -1,4 +1,4 @@
-cd /home/fanz2/STARC/evaluation/pg19/
+cd /home/fanz2/STARC/evaluation/pg19/  # Change it to your path.
 
 MODELPATH=lmsys/longchat-7b-v1.5-32k
 OUTPUT_DIR=results/ppl_eval/longchat
