@@ -90,7 +90,6 @@ pip install -e .
 pip install flash-attn==2.3.0 --no-build-isolation
 conda install -c conda-forge cupy
 conda install numpy scikit-learn
-conda install datasets
 conda install cmake
 ```
 
