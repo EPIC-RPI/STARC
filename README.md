@@ -169,7 +169,7 @@ To reproduce the results for full attention:
 
 ```bash
 python main.py --system dgx-attacc --gpu H100 --ngpu 8 --model Mistral-7B \
-  --lin 2048 --lout 24000 --batch 16 --pim bank \
+  --lin 2048 --lout 32000 --batch 16 --pim bank \
   --powerlimit --ffopt --pipeopt
 ```
 
@@ -179,30 +179,75 @@ To reproduce the results for configurations with sparse attention methods:
 
 ```bash
 python main.py --system dgx-attacc --gpu H100 --ngpu 8 --model Mistral-7B \
-  --lin 2048 --lout 24000 --batch 16 --pim bank \
+  --lin 2048 --lout 32000 --batch 16 --pim bank \
   --powerlimit --ffopt --pipeopt \
   --sparsity --kv_budget_table kv_budget_Mistral_STARC.txt
 ```
 
 Different sparse attention methods and models use different `.txt` files specified by the `--kv_budget_table` option. These files are derived from the attention masks produced by each method at each decoding step in real inference tasks (e.g., LongBench), and map them to the row-level granularity of the PIM architecture, where each DRAM row activation fetches 16 key/value vectors in parallel. They define how many memory rows are activated at each decoding step and are used to guide the simulator accordingly.
 
-> **Note 1:** When switching the evaluated method (Full attention / STARC / SparQ / Quest), please delete the previously generated `ramulator.out`; otherwise, cached results from the last run may be reused.
+> **Note 1:** Please always start simulations from the **maximum** context length (e.g., 32K). For all methods **except STARC**, the simulator cache (`ramulator.out`) generated for the longest context length can be reused for shorter context lengths. In this case, the simulator will directly read the cached results without rerunning the simulation.
 
-> **Note 2:** When reproducing methods other than STARC, comment out the following two lines in `STARC/simulator_starc/src/ramulator_wrapper.py` to avoid introducing clustering overhead:
+> **Note 2:** When switching the evaluated method (Full attention / STARC / SparQ / Quest), please delete the previously generated `ramulator.out`; otherwise, cached results from the last run may be reused.
+
+> **Note 3:** When reproducing methods other than STARC, comment out the following two lines in `STARC/simulator_starc/src/ramulator_wrapper.py` to avoid introducing clustering overhead:
 > ```python
 > if l == l_target - 1:
 >     trace_args += " --add_cluster"
 > ```
 
+> **Note 4:** When reproducing **STARC** results, due to time constraints, we are currently unable to directly present the clustering overhead separately. If you would like to isolate the clustering overhead, you may follow the steps below:
+>
+> 1. Keep the code in Note 3 **enabled**:
+>    ```python
+>    if l == l_target - 1:
+>        trace_args += " --add_cluster"
+>    ```
+>    and run the corresponding command to obtain the simulation result.
+> 2. Delete the generated `ramulator.out`.
+> 3. Comment out the above code and rerun the **same** command.
+> 4. The difference between the two results corresponds to the clustering overhead.
+>
+> We apologize for this inconvenience. We will optimize the code in future updates to directly report the clustering overhead.
 
 
 ---
 
 ## Outputs
 
-- **Model accuracy experiments:** Each `.sh` script generates a corresponding `.jsonl` file for each model and each task. These files contain the ground-truth answers, model predictions, and evaluation scores.
+<!-- - **Model accuracy experiments:** Each `.sh` script generates a corresponding `.jsonl` file for each model and each task. These files contain the ground-truth answers, model predictions, and evaluation scores.
 - **PG-19 perplexity:** A `.txt` file is generated to record the evolution of perplexity during evaluation.
-- **Simulation experiments:** The simulator produces `.xlsx` or `.csv` files that record the breakdown of end-to-end latency and energy.
+- **Simulation experiments:** The simulator produces `.xlsx` or `.csv` files that record the breakdown of end-to-end latency and energy. -->
+
+- **Model accuracy experiments:**  
+  For **LongBench**, the evaluation generates a corresponding `.jsonl` file for each model and each task. These files contain the ground-truth answers and model predictions. The final results are summarized in `result.json`.  
+  For **RULER**, evaluation results are printed directly to the terminal.
+
+- **PG-19 perplexity:**  
+  A `log_PG19.txt` file is generated to record the evolution of perplexity during evaluation.
+
+- **Simulation experiments:**  
+  The simulator produces an `output.csv` file that records the breakdown of end-to-end latency and energy consumption. An example format is shown below.
+
+
+| model | dtype | xpu | cap | bw | sys_opb | hw | cores | pipe_level | is_parallel | power_constraint | gqa_size | Lin | Lout | bs | required_cap | s_flops | g_flops | s_time | s_matmul | s_fc | s_comm | s_softmax | s_act | s_lnorm | g_time (ms) | g_matmul | g_fc | g_comm | g_etc | g_qkv_time | g_prj_time | g_ff_time | g2g_comm | c2g_comm | g_softmax | g_act | g_lnorm | g_energy (nJ) | g_dram_energy | g_l2_energy | g_l1_energy | g_reg_energy | g_alu_energy | g_fc_mem_energy | g_fc_comp_energy | g_attn_mem_energy | g_attn_comp_energy | g_etc_mem_energy | g_etc_comp_energy | g_comm_energy |
+|------|------|-----|-----|----|---------|----|-------|------------|-------------|------------------|----------|-----|------|----|--------------|----------|----------|--------|-----------|------|---------|------------|-------|----------|-------------|-----------|------|---------|-------|------------|------------|-----------|-----------|-----------|------------|-------|----------|---------------|---------------|-------------|-------------|--------------|---------------|------------------|-------------------|--------------------|---------------------|-------------------|--------------------|----------------|
+| Mistral-7B | W16A16 | GPU | 1280 | 9 | 295.1670644 | BA | 8 | TRUE | TRUE | TRUE | 0 | 2048 | 16000 | 16 | 1.63247E+11 | 26440397457 | 2.74317E+11 | 137.0683392 | 27.98165465 | 62.93091672 | 11.61364915 | 24.87258191 | 2.506916933 | 7.162619808 | 0.916930348 | 0.075737878 | 0.404029795 | 0.346612651 | 0.090550025 | 0.137451554 | 0.030404956 | 0.236173285 | 0.344865024 | 0.001747627 | 0 | 0.033255129 | 0.057294896 | 551880956.3 | 412383134.3 | 51675503 | 30652644.72 | 19149650.66 | 37147608.35 | 344396314.7 | 130849869.7 | 61361497.02 | 6874799.8 | 6625322.598 | 900737.2698 | 872415.232 |
+
+
+Since we focus **only on the decoding stage**, the following columns are used for analysis:
+
+- **Latency breakdown:**  
+  `g_matmul`, `g_fc`, `g_comm`, `g_etc`, `g_time (ms)`
+
+- **Energy breakdown:**  
+  `g_fc_mem_energy`, `g_fc_comp_energy`,  
+  `g_attn_mem_energy`, `g_attn_comp_energy`,  
+  `g_etc_mem_energy`, `g_etc_comp_energy`,  
+  `g_comm_energy`, `g_energy (nJ)`
+
+Energy consumption is further decomposed into **compute (comp)** and **memory (mem)** components.
+
 
 ---
 
