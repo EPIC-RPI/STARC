@@ -1,6 +1,20 @@
 ## initialize ramulator2 
 cd ramulator2
 git reset --hard b7c70275f04126c647edb989270cc429776955d1
+
+# Portability fix: ensure uint64_t is defined on all toolchains
+# (This commit relies on transitive includes on some systems.)
+UTILS_H="src/base/utils.h"
+if ! grep -qE '^\s*#include\s*<cstdint>\s*$' "$UTILS_H"; then
+  # Insert after the header guard or the first includes block.
+  # Safe/Idempotent: only adds the include once.
+  sed -i '1{/^#pragma once$/a#include <cstdint>\n}' "$UTILS_H"
+  # If the file doesn't start with #pragma once, insert at very top.
+  if ! head -n 3 "$UTILS_H" | grep -q "<cstdint>"; then
+    sed -i '1i#include <cstdint>\n' "$UTILS_H"
+  fi
+fi
+
 cd ..
 
 # copy files
