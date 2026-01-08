@@ -214,9 +214,7 @@ def make_model_config(name, dtype):
     model_table['MT-530B'] = [105, 20480, 128, 160, 4, 1]
     model_table['MT-1008B'] = [128, 25600, 160, 160, 4, 1]
     model_table['OPT-66B'] = [64, 9216, 72, 128, 4, 1]
-    # Add model mistral and llama
-    model_table["Mistral-7B"]   = [32, 4096, 32, 128, 7/2, 4]   # 32 layers 4096; hidden sim;  GQA 8→32 (=4×)
-    model_table["Llama-8B"] = [32, 4096, 32, 128, 7/2, 4]   # 32 layers; 4096 hidden; GQA 8→32 (=4×)
+    model_table["Mistral-7B"]   = [32, 4096, 32, 128, 7/2, 4]   # 32 layers; 4096 hidden; GQA 8→32 (=4×) 
     ndec, hdim, nheads, dhead, ff_scale, gqa_size = model_table[name]
     config = {
         'name': name,
