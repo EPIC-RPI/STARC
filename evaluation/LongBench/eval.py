@@ -109,7 +109,7 @@ def _infer_dataset_name_from_filename(filename: str) -> str:
       - <dataset>.jsonl
       - <dataset>-<number>.jsonl  (e.g., when appending token budgets)
     """
-    dataset = filename[:-5]  # remove ".jsonl"
+    dataset = filename[:-6]   # remove ".jsonl"
 
     # If the last hyphen-separated token is numeric, treat it as a suffix (e.g., token budget).
     parts = dataset.split("-")
